@@ -64,7 +64,7 @@ crate::embedded_hal_error!(
     embedded_hal::spi::ErrorKind
 );
 
-use config::Duplex;
+use config::{Duplex, LineWidth};
 
 pub trait Spi: Send {
     fn device() -> spi_host_device_t;
@@ -196,6 +196,16 @@ pub mod config {
                 Self::RxLsbFirst => SPI_DEVICE_RXBIT_LSBFIRST,
             }
         }
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub enum LineWidth {
+        /// 1-bit, 2 wire duplex or 1 wire half-duplex
+        Single,
+        /// 2-bit, 2 wire half-duplex
+        Dual,
+        /// 4-bit, 4 wire half-duplex
+        Quad,
     }
 
     /// SPI Driver configuration
