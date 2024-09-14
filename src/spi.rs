@@ -29,8 +29,10 @@
 //! The primitive [FullDuplex::read] and [FullDuplex::send] do not lock the APB frequency and
 //! therefore may run at a different frequency.
 //!
+//! Hardware command, address, dummy, and multiline SPI support are provided by the `transaction_ext()` and `transaction_ext_async()`
+//! functions.
+//!
 //! # TODO
-//! - Quad SPI
 //! - Slave SPI
 
 use core::borrow::{Borrow, BorrowMut};
@@ -747,6 +749,29 @@ where
         })
     }
 
+    pub fn transaction_ext(&mut self, transaction: TransactionExt) -> Result<(), EspError> {
+        let transactions = once(transaction).map(|t| t.to_transaction());
+        spi_transmit(self.handle, transactions, self.polling, self.queue_size)?;
+
+        Ok(())
+    }
+
+    #[cfg(not(esp_idf_spi_master_isr_in_iram))]
+    pub async fn transaction_ext_async(
+        &mut self,
+        transaction: TransactionExt<'_>,
+    ) -> Result<(), EspError> {
+        let transactions = once(transaction).map(|t| t.to_transaction());
+        core::pin::pin!(spi_transmit_async(
+            self.handle,
+            transactions,
+            self.queue_size
+        ))
+        .await?;
+
+        Ok(())
+    }
+
     pub fn read(&mut self, words: &mut [u8]) -> Result<(), EspError> {
         // Full-Duplex Mode:
         // The internal hardware 16*4 u8 FIFO buffer (shared for read/write) is not cleared
@@ -1061,7 +1086,7 @@ where
     pub fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), EspError> {
         self.run(
             self.hardware_cs_ctl(operations.iter_mut().map(copy_operation))?,
-            operations.iter_mut().map(copy_operation),
+            self.spi_operations(operations.iter_mut().map(copy_operation)),
         )
     }
 
@@ -1072,9 +1097,33 @@ where
     ) -> Result<(), EspError> {
         core::pin::pin!(self.run_async(
             self.hardware_cs_ctl(operations.iter_mut().map(copy_operation))?,
-            operations.iter_mut().map(copy_operation),
+            self.spi_operations(operations.iter_mut().map(copy_operation)),
         ))
         .await
+    }
+
+    pub fn transaction_ext(&mut self, transaction: TransactionExt) -> Result<(), EspError> {
+        let cs_pin: CsCtl<'_, '_, AnyOutputPin, Output> = CsCtl::Hardware {
+            enabled: self.cs_pin_configured,
+            transactions_count: 1,
+            last_transaction: Some(0),
+        };
+        let operations = once(SpiOperation::Transaction(transaction.to_transaction()));
+        self.run(cs_pin, operations)
+    }
+
+    #[cfg(not(esp_idf_spi_master_isr_in_iram))]
+    pub async fn transaction_ext_async(
+        &mut self,
+        transaction: TransactionExt<'_>,
+    ) -> Result<(), EspError> {
+        let cs_pin: CsCtl<'_, '_, AnyOutputPin, Output> = CsCtl::Hardware {
+            enabled: self.cs_pin_configured,
+            transactions_count: 1,
+            last_transaction: Some(0),
+        };
+        let operations = once(SpiOperation::Transaction(transaction.to_transaction()));
+        core::pin::pin!(self.run_async(cs_pin, operations)).await
     }
 
     pub fn read(&mut self, read: &mut [u8]) -> Result<(), EspError> {
@@ -1116,7 +1165,7 @@ where
     fn run<'a, 'c, 'p, P, M>(
         &mut self,
         mut cs_pin: CsCtl<'c, 'p, P, M>,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = SpiOperation> + 'a,
     ) -> Result<(), EspError>
     where
         P: OutputPin,
@@ -1130,8 +1179,7 @@ where
 
         cs_pin.raise_cs()?;
 
-        let mut spi_operations = self
-            .spi_operations(operations)
+        let mut spi_operations = operations
             .enumerate()
             .map(|(index, mut operation)| {
                 cs_pin.configure(&mut operation, index);
@@ -1171,7 +1219,7 @@ where
     async fn run_async<'a, 'c, 'p, P, M>(
         &self,
         mut cs_pin: CsCtl<'c, 'p, P, M>,
-        operations: impl Iterator<Item = Operation<'a, u8>> + 'a,
+        operations: impl Iterator<Item = SpiOperation> + 'a,
     ) -> Result<(), EspError>
     where
         P: OutputPin,
@@ -1194,8 +1242,7 @@ where
         let delay_impl = crate::delay::Delay::new_default(); // TODO: Need to wait asnchronously if in async mode
         let mut result = Ok(());
 
-        let mut spi_operations = self
-            .spi_operations(operations)
+        let mut spi_operations = operations
             .enumerate()
             .map(|(index, mut operation)| {
                 cs_pin.configure(&mut operation, index);
@@ -1472,12 +1519,12 @@ where
                     Operation::TransferInPlace(words)
                 }
             }))?,
-            operations.iter_mut().map(|op| match op {
+            self.spi_operations(operations.iter_mut().map(|op| match op {
                 embedded_hal_0_2::blocking::spi::Operation::Write(words) => Operation::Write(words),
                 embedded_hal_0_2::blocking::spi::Operation::Transfer(words) => {
                     Operation::TransferInPlace(words)
                 }
-            }),
+            })),
         )
         .map_err(to_spi_err)
     }
@@ -1603,6 +1650,41 @@ where
         self
     }
 
+    pub fn transaction_ext(&mut self, transaction: TransactionExt) -> Result<(), EspError> {
+        let cs_pin = CsCtl::Software {
+            cs: &mut self.cs_pin,
+            pre_delay: self.pre_delay_us,
+            post_delay: self.post_delay_us,
+        };
+
+        self.shared_device.borrow().lock(move |device| {
+            let operations = once(SpiOperation::Transaction(transaction.to_transaction()));
+            device.run(cs_pin, operations)
+        })
+    }
+
+    #[cfg(not(esp_idf_spi_master_isr_in_iram))]
+    pub async fn transaction_ext_async(
+        &mut self,
+        transaction: TransactionExt<'_>,
+    ) -> Result<(), EspError> {
+        let cs_pin = CsCtl::Software {
+            cs: &mut self.cs_pin,
+            pre_delay: self.pre_delay_us,
+            post_delay: self.post_delay_us,
+        };
+
+        let device = self.shared_device.borrow();
+
+        let _async_guard = device.async_lock.lock().await;
+        let _guard = device.lock.enter();
+
+        let driver = unsafe { device.driver_mut() };
+
+        let operations = once(SpiOperation::Transaction(transaction.to_transaction()));
+        driver.run_async(cs_pin, operations).await
+    }
+
     pub fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), EspError> {
         self.run(operations.iter_mut().map(copy_operation))
     }
@@ -1663,7 +1745,7 @@ where
 
         self.shared_device
             .borrow()
-            .lock(move |device| device.run(cs_pin, operations))
+            .lock(move |device| device.run(cs_pin, device.spi_operations(operations)))
     }
 
     #[allow(dead_code)]
@@ -1684,7 +1766,9 @@ where
 
         let driver = unsafe { device.driver_mut() };
 
-        driver.run_async(cs_pin, operations).await
+        driver
+            .run_async(cs_pin, driver.spi_operations(operations))
+            .await
     }
 }
 
