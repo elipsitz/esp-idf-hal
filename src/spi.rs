@@ -368,6 +368,142 @@ pub mod config {
     }
 }
 
+/// Extended SPI transaction.
+///
+/// Provides hardware support for command, address, dummy, and data phases,
+/// as well as multiline SPI.
+pub struct TransactionExt<'a> {
+    read_buf: Option<&'a mut [u8]>,
+    write_buf: Option<&'a [u8]>,
+    line_width: LineWidth,
+    dummy_cycles: u8,
+    command: (u16, u8),
+    address: (u64, u8),
+    command_multiline: bool,
+    address_multiline: bool,
+}
+
+impl<'a> TransactionExt<'a> {
+    fn to_transaction(&self) -> spi_transaction_ext_t {
+        let mut flags = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+        if self.command_multiline {
+            flags |= SPI_TRANS_MULTILINE_CMD;
+        }
+        if self.address_multiline {
+            flags |= SPI_TRANS_MULTILINE_ADDR;
+        }
+        flags |= match self.line_width {
+            LineWidth::Single => 0,
+            LineWidth::Dual => SPI_TRANS_MODE_DIO,
+            LineWidth::Quad => SPI_TRANS_MODE_QIO,
+        };
+        spi_transaction_ext_t {
+            base: spi_transaction_t {
+                flags,
+                cmd: self.command.0,
+                addr: self.address.0,
+                length: 8 * self.write_buf.map_or(0, |x| x.len()),
+                rxlength: 8 * self.read_buf.as_ref().map_or(0, |x| x.len()),
+                __bindgen_anon_1: spi_transaction_t__bindgen_ty_1 {
+                    tx_buffer: self
+                        .write_buf
+                        .map_or(ptr::null(), |x| x.as_ptr() as *const _),
+                },
+                __bindgen_anon_2: spi_transaction_t__bindgen_ty_2 {
+                    rx_buffer: self
+                        .read_buf
+                        .as_ref()
+                        .map_or(ptr::null_mut(), |x| x.as_ptr() as *mut _),
+                },
+                ..Default::default()
+            },
+            command_bits: self.command.1,
+            address_bits: self.address.1,
+            dummy_bits: self.dummy_cycles,
+        }
+    }
+
+    fn default() -> Self {
+        Self {
+            read_buf: None,
+            write_buf: None,
+            line_width: LineWidth::Single,
+            dummy_cycles: 0,
+            command: (0, 0),
+            address: (0, 0),
+            command_multiline: false,
+            address_multiline: false,
+        }
+    }
+
+    /// Half-duplex read
+    ///
+    /// Defaults to no command, address, or dummy phases.
+    pub fn read(read: &'a mut [u8]) -> Self {
+        Self {
+            read_buf: Some(read),
+            ..Self::default()
+        }
+    }
+
+    /// Half-duplex write
+    ///
+    /// Defaults to no command, address, or dummy phases.
+    pub fn write(write: &'a [u8]) -> Self {
+        Self {
+            write_buf: Some(write),
+            ..Self::default()
+        }
+    }
+
+    /// Full duplex, simultaneous read and write
+    ///
+    /// Defaults to no command, address, or dummy phases.
+    pub fn transfer(read: &'a mut [u8], write: &'a [u8]) -> Self {
+        Self {
+            read_buf: Some(read),
+            write_buf: Some(write),
+            ..Self::default()
+        }
+    }
+
+    /// Set the line width of the data phase
+    pub fn line_width(mut self, line_width: LineWidth) -> Self {
+        self.line_width = line_width;
+        self
+    }
+
+    /// Set the number of dummy cycles
+    pub fn dummy_cycles(mut self, dummy_cycles: u8) -> Self {
+        self.dummy_cycles = dummy_cycles;
+        self
+    }
+
+    /// Enable the command phase, with the provided value and bit length
+    pub fn command(mut self, value: u16, bits: u8) -> Self {
+        self.command = (value, bits);
+        self
+    }
+
+    /// Use the configured line width for the command phase
+    pub fn command_multiline(mut self) -> Self {
+        self.command_multiline = true;
+        self
+    }
+
+    /// Enable the address phase, with the provided value and bit length
+    pub fn address(mut self, value: u64, bits: u8) -> Self {
+        self.address = (value, bits);
+        self
+    }
+
+    /// Use the configured line width for the address phase
+    pub fn address_multiline(mut self) -> Self {
+        self.address_multiline = true;
+        self
+    }
+}
+
 pub struct SpiDriver<'d> {
     host: u8,
     max_transfer_size: usize,
