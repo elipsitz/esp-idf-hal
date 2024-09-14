@@ -809,12 +809,12 @@ where
 }
 
 enum SpiOperation {
-    Transaction(spi_transaction_t),
+    Transaction(spi_transaction_ext_t),
     Delay(u32),
 }
 
 impl SpiOperation {
-    pub fn transaction(self) -> Option<spi_transaction_t> {
+    pub fn transaction(self) -> Option<spi_transaction_ext_t> {
         if let Self::Transaction(transaction) = self {
             Some(transaction)
         } else {
@@ -1703,7 +1703,7 @@ where
         }
     }
 
-    fn configure_transaction(&self, transaction: &mut spi_transaction_t, index: usize) {
+    fn configure_transaction(&self, transaction: &mut spi_transaction_ext_t, index: usize) {
         if let Self::Hardware {
             enabled,
             last_transaction,
@@ -1719,7 +1719,7 @@ fn spi_read_transactions(
     words: &mut [u8],
     chunk_size: usize,
     duplex: Duplex,
-) -> impl Iterator<Item = spi_transaction_t> + '_ {
+) -> impl Iterator<Item = spi_transaction_ext_t> + '_ {
     words.chunks_mut(chunk_size).map(move |chunk| {
         spi_create_transaction(
             chunk.as_mut_ptr(),
@@ -1737,7 +1737,7 @@ fn spi_read_transactions(
 fn spi_write_transactions(
     words: &[u8],
     chunk_size: usize,
-) -> impl Iterator<Item = spi_transaction_t> + '_ {
+) -> impl Iterator<Item = spi_transaction_ext_t> + '_ {
     words
         .chunks(chunk_size)
         .map(|chunk| spi_create_transaction(core::ptr::null_mut(), chunk.as_ptr(), chunk.len(), 0))
@@ -1746,7 +1746,7 @@ fn spi_write_transactions(
 fn spi_transfer_in_place_transactions(
     words: &mut [u8],
     chunk_size: usize,
-) -> impl Iterator<Item = spi_transaction_t> + '_ {
+) -> impl Iterator<Item = spi_transaction_ext_t> + '_ {
     words.chunks_mut(chunk_size).map(|chunk| {
         spi_create_transaction(
             chunk.as_mut_ptr(),
@@ -1762,7 +1762,7 @@ fn spi_transfer_transactions<'a>(
     write: &'a [u8],
     chunk_size: usize,
     duplex: Duplex,
-) -> impl Iterator<Item = spi_transaction_t> + 'a {
+) -> impl Iterator<Item = spi_transaction_ext_t> + 'a {
     enum OperationsIter<E, R, W> {
         Equal(E),
         ReadLonger(R),
@@ -1771,11 +1771,11 @@ fn spi_transfer_transactions<'a>(
 
     impl<E, R, W> Iterator for OperationsIter<E, R, W>
     where
-        E: Iterator<Item = spi_transaction_t>,
-        R: Iterator<Item = spi_transaction_t>,
-        W: Iterator<Item = spi_transaction_t>,
+        E: Iterator<Item = spi_transaction_ext_t>,
+        R: Iterator<Item = spi_transaction_ext_t>,
+        W: Iterator<Item = spi_transaction_ext_t>,
     {
-        type Item = spi_transaction_t;
+        type Item = spi_transaction_ext_t;
 
         fn next(&mut self) -> Option<Self::Item> {
             match self {
@@ -1813,7 +1813,7 @@ fn spi_transfer_equal_transactions<'a>(
     read: &'a mut [u8],
     write: &'a [u8],
     chunk_size: usize,
-) -> impl Iterator<Item = spi_transaction_t> + 'a {
+) -> impl Iterator<Item = spi_transaction_ext_t> + 'a {
     read.chunks_mut(chunk_size)
         .zip(write.chunks(chunk_size))
         .map(|(read_chunk, write_chunk)| {
@@ -1832,53 +1832,58 @@ fn spi_create_transaction(
     write: *const u8,
     transaction_length: usize,
     rx_length: usize,
-) -> spi_transaction_t {
-    spi_transaction_t {
-        flags: 0,
-        __bindgen_anon_1: spi_transaction_t__bindgen_ty_1 {
-            tx_buffer: write as *const _,
+) -> spi_transaction_ext_t {
+    spi_transaction_ext_t {
+        base: spi_transaction_t {
+            flags: 0,
+            __bindgen_anon_1: spi_transaction_t__bindgen_ty_1 {
+                tx_buffer: write as *const _,
+            },
+            __bindgen_anon_2: spi_transaction_t__bindgen_ty_2 {
+                rx_buffer: read as *mut _,
+            },
+            length: (transaction_length * 8) as _,
+            rxlength: (rx_length * 8) as _,
+            ..Default::default()
         },
-        __bindgen_anon_2: spi_transaction_t__bindgen_ty_2 {
-            rx_buffer: read as *mut _,
-        },
-        length: (transaction_length * 8) as _,
-        rxlength: (rx_length * 8) as _,
         ..Default::default()
     }
 }
 
-fn set_keep_cs_active(transaction: &mut spi_transaction_t, _keep_cs_active: bool) {
+fn set_keep_cs_active(transaction: &mut spi_transaction_ext_t, _keep_cs_active: bool) {
     if _keep_cs_active {
-        transaction.flags |= SPI_TRANS_CS_KEEP_ACTIVE
+        transaction.base.flags |= SPI_TRANS_CS_KEEP_ACTIVE
     }
 }
 
 fn spi_transmit(
     handle: spi_device_handle_t,
-    transactions: impl Iterator<Item = spi_transaction_t>,
+    transactions: impl Iterator<Item = spi_transaction_ext_t>,
     polling: bool,
     queue_size: usize,
 ) -> Result<(), EspError> {
     if polling {
         for mut transaction in transactions {
-            esp!(unsafe { spi_device_polling_transmit(handle, &mut transaction as *mut _) })?;
+            esp!(unsafe { spi_device_polling_transmit(handle, &mut transaction.base as *mut _) })?;
         }
     } else {
-        pub type Queue = Deque<spi_transaction_t, MAX_QUEUED_TRANSACTIONS>;
+        pub type Queue = Deque<spi_transaction_ext_t, MAX_QUEUED_TRANSACTIONS>;
 
         let mut queue = Queue::new();
         let queue_size = min(MAX_QUEUED_TRANSACTIONS, queue_size);
 
         let push = |queue: &mut Queue, transaction| {
             let _ = queue.push_back(transaction);
-            esp!(unsafe { spi_device_queue_trans(handle, queue.back_mut().unwrap(), delay::BLOCK) })
+            esp!(unsafe {
+                spi_device_queue_trans(handle, &mut queue.back_mut().unwrap().base, delay::BLOCK)
+            })
         };
 
         let pop = |queue: &mut Queue| {
             let mut rtrans = ptr::null_mut();
             esp!(unsafe { spi_device_get_trans_result(handle, &mut rtrans, delay::BLOCK) })?;
 
-            if rtrans != queue.front_mut().unwrap() {
+            if rtrans != &mut queue.front_mut().unwrap().base {
                 unreachable!();
             }
             queue.pop_front().unwrap();
@@ -1913,10 +1918,10 @@ fn spi_transmit(
 #[allow(dead_code)]
 async fn spi_transmit_async(
     handle: spi_device_handle_t,
-    transactions: impl Iterator<Item = spi_transaction_t>,
+    transactions: impl Iterator<Item = spi_transaction_ext_t>,
     queue_size: usize,
 ) -> Result<(), EspError> {
-    pub type Queue = Deque<(spi_transaction_t, HalIsrNotification), MAX_QUEUED_TRANSACTIONS>;
+    pub type Queue = Deque<(spi_transaction_ext_t, HalIsrNotification), MAX_QUEUED_TRANSACTIONS>;
 
     let mut queue = Queue::new();
     let queue = &mut queue;
@@ -1932,8 +1937,10 @@ async fn spi_transmit_async(
             queued.set(queue.len());
 
             let last = queue.back_mut().unwrap();
-            last.0.user = &last.1 as *const _ as *mut _;
-            match esp!(unsafe { spi_device_queue_trans(handle, &mut last.0, delay::NON_BLOCK) }) {
+            last.0.base.user = &last.1 as *const _ as *mut _;
+            match esp!(unsafe {
+                spi_device_queue_trans(handle, &mut last.0.base, delay::NON_BLOCK)
+            }) {
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => unreachable!(),
                 other => other,
             }
@@ -1948,7 +1955,7 @@ async fn spi_transmit_async(
                 other => other,
             }?;
 
-            if rtrans != &mut queue.front_mut().unwrap().0 {
+            if rtrans != &mut queue.front_mut().unwrap().0.base {
                 unreachable!();
             }
 
